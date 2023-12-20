@@ -3,6 +3,8 @@ import json
 import time
 import logging
 import warnings
+
+from utils.utils import EosListStoppingCriteria
 warnings.filterwarnings("ignore")
 
 import random
@@ -39,6 +41,12 @@ class ModelArguments:
     )
     cache_dir: Optional[str] = field(
         default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
+    )
+    prefix_prompt: Optional[str] = field(
+        default=None, metadata={"help": "prefix prompt"}
+    )
+    postfix_prompt: Optional[str] = field(
+        default=None, metadata={"help": "postfix prompt"}
     )
     def __post_init__(self):
         if self.tokenizer_name is None:
@@ -100,7 +108,7 @@ def load_data(dataset_name_or_path, cache_dir: str=None):
     """Load data from huggingface hub or load local json file"""
     try:
         dataset = load_dataset(dataset_name_or_path, cache_dir=cache_dir)
-        return dataset
+        return dataset["test"]
     except Exception:
         logger.info(
             "Failed to load dataset from huggingface hub. "
@@ -111,12 +119,15 @@ def load_data(dataset_name_or_path, cache_dir: str=None):
         
         return dataset["test"]
 
-def preprocess_function(tokenizer, data_args):
+def preprocess_function(tokenizer, model_args, data_args):
     def _preprocess_function(examples):
         new_inputs = []
-        for _input in examples["input"]:
+        for _input in examples["java"]:
             # TODO: add preprocess operation
-            pass
+            new_str = (model_args.prefix_prompt + 
+                       "\n" + _input + "\n" + 
+                       model_args.postfix_prompt)
+            new_inputs.append(new_str)
             
         return tokenizer(new_inputs, 
                         truncation=True, 
@@ -163,8 +174,8 @@ if __name__ == "__main__":
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer,
                                             padding=True,
                                             max_length=data_args.max_length)
-
-    tokenized_dataset = dataset.map(preprocess_function,
+    preprocess_fn = preprocess_function(tokenizer, model_args, data_args)
+    tokenized_dataset = dataset.map(preprocess_fn,
                                     batched=True,
                                     num_proc=data_args.num_proc,
                                     remove_columns=dataset.column_names,
@@ -179,6 +190,8 @@ if __name__ == "__main__":
     model, ds_loader = accelerator.prepare(model, ds_loader)
     os.makedirs(data_args.output_dir, exist_ok=True)
     
+    # logger.info("Demo input:\n" + tokenizer.decode(ds_loader[0]))
+    
     # ===========================================
     #               START GENERATING
     # ===========================================
@@ -189,24 +202,32 @@ if __name__ == "__main__":
     results = []
     for batch_id, batch in tqdm(enumerate(ds_loader), total=total):
         with torch.no_grad():
-            outputs = model.generate(input_ids=batch["input_ids"], 
-                                     generation_config=generator_config)
+            outputs = accelerator.unwrap_model(model).generate(
+                        input_ids=batch["input_ids"], 
+                        generation_config=generator_config,
+                        eos_token_id=tokenizer.eos_token_id,
+                        pad_token_id= tokenizer.eos_token_id,
+                        stopping_criteria=EosListStoppingCriteria(tokenizer.eos_token_id))
         
         # generated_tasks = batch["ids"].repeat(gen_args.num_return_sequences)
         generated_tokens = accelerator.pad_across_processes(
             outputs, dim=1, pad_index=tokenizer.pad_token_id
         )
         
-        writer = open(os.path.join(data_args.output_dir, f"evol_inst_{batch_id}.jsonl"), "w")
-        for generated_token in generated_tokens:
-            gen_code = tokenizer.decode(
-                generated_token,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=True)
-            
-            results.append()
-    
-    # TODO: save results or plot it
+        writer = open(os.path.join(data_args.output_dir, f"{batch_id}.jsonl"), "w")
+        inputs = tokenizer.batch_decode(batch["input_ids"], 
+                                        skip_special_tokens=True,
+                                        clean_up_tokenization_spaces=True)
+        results = tokenizer.batch_decode(generated_tokens, 
+                               skip_special_tokens=True, 
+                               clean_up_tokenization_spaces=True)
+        print(len(inputs), len(results))
+        print(inputs)
+        print("="*50)
+        print(results)
+        
+        # for idx in range(len(results)):
+        #     writer.write(json.dumps({"input": inputs[idx], "output": results[idx]}) + "\n")
     
     logger.info("Completion time: %d min", (time.time() - start_time) // 60)
     
