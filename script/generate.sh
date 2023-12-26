@@ -15,7 +15,7 @@ accelerate launch \
     --top_k 40 \
     --do_sample \
     --num_return_sequences 2 \
-    --max_length 2048 \
+    --max_length 512 \
     --num_proc 50 \
     --cache_dir /datadrive05/dungnm31/.cache \
     --output_dir ./output \

@@ -123,10 +123,8 @@ def preprocess_function(tokenizer, model_args, data_args):
     def _preprocess_function(examples):
         new_inputs = []
         for _input in examples["java"]:
-            # TODO: add preprocess operation
-            new_str = (model_args.prefix_prompt + 
-                       "\n" + _input + "\n" + 
-                       model_args.postfix_prompt)
+            new_str = (model_args.prefix_prompt + _input + "\n" + model_args.postfix_prompt)
+            new_str = f"<s>[INST]{new_str}[/INST]"  # mixtral template
             new_inputs.append(new_str)
             
         return tokenizer(new_inputs, 
@@ -207,7 +205,9 @@ if __name__ == "__main__":
                         generation_config=generator_config,
                         eos_token_id=tokenizer.eos_token_id,
                         pad_token_id= tokenizer.eos_token_id,
-                        stopping_criteria=EosListStoppingCriteria(tokenizer.eos_token_id))
+                        stopping_criteria=[
+                            EosListStoppingCriteria([tokenizer.eos_token_id])
+                        ])
         
         # generated_tasks = batch["ids"].repeat(gen_args.num_return_sequences)
         generated_tokens = accelerator.pad_across_processes(
