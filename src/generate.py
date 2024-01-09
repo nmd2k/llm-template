@@ -43,10 +43,10 @@ class ModelArguments:
         default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
     )
     prefix_prompt: Optional[str] = field(
-        default=None, metadata={"help": "prefix prompt"}
+        default="", metadata={"help": "prefix prompt"}
     )
     postfix_prompt: Optional[str] = field(
-        default=None, metadata={"help": "postfix prompt"}
+        default="", metadata={"help": "postfix prompt"}
     )
     def __post_init__(self):
         if self.tokenizer_name is None:
@@ -122,10 +122,15 @@ def load_data(dataset_name_or_path, cache_dir: str=None):
 def preprocess_function(tokenizer, model_args, data_args):
     def _preprocess_function(examples):
         new_inputs = []
-        for _input in examples["java"]:
-            new_str = (model_args.prefix_prompt + _input + "\n" + model_args.postfix_prompt)
-            new_str = f"<s>[INST]{new_str}[/INST]"  # mixtral template
-            new_inputs.append(new_str)
+        for idx in range(len(examples['code'])):
+            input_str = (
+                model_args.prefix_prompt + 
+                f"\n### Code documentation:\n{examples['original_docstring'][idx]}" +
+                f"\n### Code snippet:\n```{examples['code'][idx]}```" +
+                model_args.postfix_prompt
+            )
+            new_inputs.append(input_str)
+        # new_str = f"<s>[INST]{new_str}[/INST]</s>"  # mixtral template
             
         return tokenizer(new_inputs, 
                         truncation=True, 
@@ -156,15 +161,27 @@ if __name__ == "__main__":
                                                  cache_dir=model_args.cache_dir,
                                                  trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name)
+    
+    special_tokens = {}
     if tokenizer.pad_token_id is None:
         logger.info(
             "Tokenizer does not has pad token. Set the pad_token to eos_token.")
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+        special_tokens['pad_token'] = tokenizer.eos_token
+        # tokenizer.pad_token_id = tokenizer.eos_token_id
+    if tokenizer.bos_token_id is None:
+        logger.info(
+            "Tokenizer does not has pad token. Set the pad_token to eos_token.")
+        special_tokens['bos_token'] = "<s>"
+        tokenizer.add_bos_token = True
+    if special_tokens:
+        tokenizer.add_special_tokens(special_tokens)
+    
     tokenizer.padding_side = data_args.padding_side
     
     generator_config = GenerationConfig(**gen_args.__dict__,
                                         max_length   = data_args.max_length,
                                         pad_token_id = tokenizer.pad_token_id,
+                                        bos_token_id = tokenizer.bos_token_id,
                                         eos_token_id = tokenizer.eos_token_id)
     
     dataset = load_data(data_args.dataset_name_or_path, model_args.cache_dir)
@@ -177,7 +194,7 @@ if __name__ == "__main__":
                                     batched=True,
                                     num_proc=data_args.num_proc,
                                     remove_columns=dataset.column_names,
-                                    load_from_cache_file=True,
+                                    # load_from_cache_file=True,
                                     desc="Running tokenizer on dataset")
 
     ds_loader = DataLoader(tokenized_dataset,
@@ -188,7 +205,7 @@ if __name__ == "__main__":
     model, ds_loader = accelerator.prepare(model, ds_loader)
     os.makedirs(data_args.output_dir, exist_ok=True)
     
-    # logger.info("Demo input:\n" + tokenizer.decode(ds_loader[0]))
+    logger.info("Demo input:\n" + tokenizer.decode(tokenized_dataset[0]['input_ids']))
     
     # ===========================================
     #               START GENERATING
@@ -203,6 +220,7 @@ if __name__ == "__main__":
             outputs = accelerator.unwrap_model(model).generate(
                         input_ids=batch["input_ids"], 
                         generation_config=generator_config,
+                        bos_token_id=tokenizer.bos_token_id,
                         eos_token_id=tokenizer.eos_token_id,
                         pad_token_id= tokenizer.eos_token_id,
                         stopping_criteria=[
@@ -216,18 +234,15 @@ if __name__ == "__main__":
         
         writer = open(os.path.join(data_args.output_dir, f"{batch_id}.jsonl"), "w")
         inputs = tokenizer.batch_decode(batch["input_ids"], 
-                                        skip_special_tokens=True,
                                         clean_up_tokenization_spaces=True)
         results = tokenizer.batch_decode(generated_tokens, 
-                               skip_special_tokens=True, 
                                clean_up_tokenization_spaces=True)
-        print(len(inputs), len(results))
-        print(inputs)
+        print(inputs[0])
         print("="*50)
-        print(results)
+        print(results[0])
         
-        # for idx in range(len(results)):
-        #     writer.write(json.dumps({"input": inputs[idx], "output": results[idx]}) + "\n")
+        for idx in range(len(results)):
+            writer.write(json.dumps({"input": inputs[idx], "output": results[idx]}) + "\n")
     
     logger.info("Completion time: %d min", (time.time() - start_time) // 60)
     
