@@ -8,6 +8,7 @@ from utils.utils import EosListStoppingCriteria
 warnings.filterwarnings("ignore")
 
 import random
+import pandas as pd
 from tqdm import tqdm
 from typing import Optional
 from dataclasses import dataclass, field
@@ -179,7 +180,8 @@ if __name__ == "__main__":
     tokenizer.padding_side = data_args.padding_side
     
     generator_config = GenerationConfig(**gen_args.__dict__,
-                                        max_length   = data_args.max_length,
+                                        max_length   = data_args.max_length * 2,
+                                        # 1 for input, 1 for output
                                         pad_token_id = tokenizer.pad_token_id,
                                         bos_token_id = tokenizer.bos_token_id,
                                         eos_token_id = tokenizer.eos_token_id)
@@ -194,7 +196,7 @@ if __name__ == "__main__":
                                     batched=True,
                                     num_proc=data_args.num_proc,
                                     remove_columns=dataset.column_names,
-                                    # load_from_cache_file=True,
+                                    load_from_cache_file=True,
                                     desc="Running tokenizer on dataset")
 
     ds_loader = DataLoader(tokenized_dataset,
@@ -223,26 +225,28 @@ if __name__ == "__main__":
                         bos_token_id=tokenizer.bos_token_id,
                         eos_token_id=tokenizer.eos_token_id,
                         pad_token_id= tokenizer.eos_token_id,
-                        stopping_criteria=[
-                            EosListStoppingCriteria([tokenizer.eos_token_id])
-                        ])
+                        # stopping_criteria=[
+                        #     EosListStoppingCriteria([tokenizer.eos_token_id])]
+                        )
         
         # generated_tasks = batch["ids"].repeat(gen_args.num_return_sequences)
         generated_tokens = accelerator.pad_across_processes(
             outputs, dim=1, pad_index=tokenizer.pad_token_id
         )
         
-        writer = open(os.path.join(data_args.output_dir, f"{batch_id}.jsonl"), "w")
-        inputs = tokenizer.batch_decode(batch["input_ids"], 
-                                        clean_up_tokenization_spaces=True)
-        results = tokenizer.batch_decode(generated_tokens, 
-                               clean_up_tokenization_spaces=True)
-        print(inputs[0])
-        print("="*50)
-        print(results[0])
+        # batch input is already contained inside generated output
+        # batch_inputs = tokenizer.batch_decode(batch["input_ids"],
+        #                                 skip_special_tokens=True,
+        #                                 clean_up_tokenization_spaces=True)
+        batch_results = tokenizer.batch_decode(generated_tokens, 
+                                skip_special_tokens=True,
+                                clean_up_tokenization_spaces=True)
         
-        for idx in range(len(results)):
-            writer.write(json.dumps({"input": inputs[idx], "output": results[idx]}) + "\n")
+        results.extend(batch_results)
+        
+    output_path = os.path.join(data_args.output_dir, f"generated_results.jsonl")
+    df = pd.DataFrame({'generated': results})
+    df.to_json(output_path, orient="records", lines=True)
     
     logger.info("Completion time: %d min", (time.time() - start_time) // 60)
     
