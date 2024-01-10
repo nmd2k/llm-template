@@ -1,19 +1,18 @@
 # =========
 # Script for generating the vault code generation
 # =========
-export TRANSFORMERS_CACHE="/app/.cache"
-export HF_DATASETS_CACHE="/app/.cache"
+export HF_HOME="/app/.cache"
 # export https_proxy=http://10.16.29.10:8080
 
 # mistralai/Mixtral-8x7B-Instruct-v0.1
 # codellama/CodeLlama-34b-Instruct-hf
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 accelerate launch \
     --config_file config/standard.yaml \
     src/generate.py \
     --model_name_or_path mistralai/Mistral-7B-Instruct-v0.2 \
     --dataset_name_or_path /app/data/instruct-data/process_data/code_generation/small_thevault.jsonl \
-    --batch_size 16 \
+    --batch_size 4 \
     --temperature 0.9 \
     --top_p 0.95 \
     --top_k 40 \
