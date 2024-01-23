@@ -121,24 +121,40 @@ def load_data(dataset_name_or_path, cache_dir: str=None):
         return dataset["test"]
 
 def preprocess_function(tokenizer, model_args, data_args):
-    def _preprocess_function(examples):
-        new_inputs = []
-        for idx in range(len(examples['code'])):
-            input_str = (
-                model_args.prefix_prompt + 
-                f"\n### Code documentation:\n{examples['original_docstring'][idx]}" +
-                f"\n### Code snippet:\n```{examples['code'][idx]}```" +
-                model_args.postfix_prompt
-            )
-            new_inputs.append(input_str)
-        # new_str = f"<s>[INST]{new_str}[/INST]</s>"  # mixtral template
-            
-        return tokenizer(new_inputs, 
-                        truncation=True, 
-                        max_length=data_args.max_length,
-                        padding=False,
-                        return_tensors=None)
+    prefix_prompt_tokens , postfix_prompt_tokens = [], []
+    if model_args.prefix_prompt is not None:
+        prefix_prompt_tokens = tokenizer.encode(
+            model_args.prefix_prompt, 
+            add_special_tokens=False)
+    if model_args.postfix_prompt is not None:
+        postfix_prompt_tokens = tokenizer.encode(
+            model_args.postfix_prompt, 
+            add_special_tokens=False)
     
+    def _preprocess_function(examples):
+        bs = len(examples['code'])
+        # new_str = f"<s>[INST]{new_str}[/INST]</s>"  # mixtral template
+        new_inputs = []
+        for idx in range(bs):
+            input_str = f"\n### Code snippet: \n```{examples['code'][idx]}```\n"
+            input_str += "No," if examples['label'][idx] else "Yes,"
+            new_inputs.append(input_str)
+        
+        max_length = data_args.max_length - len(prefix_prompt_tokens) - len(postfix_prompt_tokens)
+        model_inputs = tokenizer(new_inputs,
+                                 truncation=True, 
+                                 max_length=max_length,
+                                 padding=False,
+                                 return_tensors=None)
+        
+        for i in range(bs):
+            model_inputs["input_ids"][i] = (prefix_prompt_tokens + 
+                                            model_inputs["input_ids"][i] + 
+                                            postfix_prompt_tokens)
+            model_inputs["attention_mask"][i] = [1] * len(model_inputs["input_ids"][i])
+            assert len(model_inputs["input_ids"][i]) <= (data_args.max_length*2)
+            
+        return model_inputs
     return _preprocess_function
 
 # ==================================================
@@ -243,6 +259,8 @@ if __name__ == "__main__":
                                 clean_up_tokenization_spaces=True)
         
         results.extend(batch_results)
+        if batch_id == 0:
+            logger.info("Demo output:\n" + batch_results[0])
         
     output_path = os.path.join(data_args.output_dir, f"generated_results.jsonl")
     df = pd.DataFrame({'generated': results})
