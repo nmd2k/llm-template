@@ -2,221 +2,211 @@ import os
 import sys
 import logging
 import warnings
-import yaml
+import random
+import copy
+
+from typing import Optional, Dict
+from dataclasses import dataclass, field
 
 import torch
 import datasets
 import transformers
-from transformers import (
-    HfArgumentParser,
-    TrainingArguments,
-    BitsAndBytesConfig,
-    AutoModel,
-    LlamaForCausalLM,
-    AutoModelForCausalLM,
-    AutoModelForSeq2SeqLM,
-    LlamaTokenizer,
-    CodeLlamaTokenizer,
-    AutoTokenizer,
-    AutoConfig,
+from accelerate import Accelerator
+from torch.utils.data import DataLoader
+from transformers import HfArgumentParser, TrainingArguments, \
+    AutoModelForCausalLM, AutoTokenizer, AutoConfig, \
+    DataCollatorWithPadding, Trainer, \
     set_seed
-)
-from peft import LoraConfig, get_peft_model, \
-    prepare_model_for_int8_training, PeftModel, \
-    get_peft_model_state_dict
 
-from src.utils.logger import create_logger
-from src.utils.training_utils import train, \
-    smart_tokenizer_and_embedding_resize, SavePeftModelCallback
-from src.models.data_args import DataTrainingArguments
-from src.models.model_args import ModelArguments
-from src.models.gen_args import GeneratorArguments
-from src.utils.utils import display_params
+# from peft import LoraConfig, get_peft_model, \
+#     prepare_model_for_int8_training, PeftModel, \
+#     get_peft_model_state_dict
 
+logger = logging.getLogger(__name__)
+warnings.filterwarnings("ignore")  # Ignore Transformers' caching warning
 
-def load_model(args, config, is_train=True):
-    def _issue_warnings_after_load(load_result):
-        if len(load_result.missing_keys) != 0:
-            if model._keys_to_ignore_on_save is not None and set(load_result.missing_keys) == set(
-                model._keys_to_ignore_on_save
-            ):
-                model.tie_weights()
-            else:
-                print(f"There were missing keys in the checkpoint model loaded: {load_result.missing_keys}.")
-        if len(load_result.unexpected_keys) != 0:
-            print(
-                f"There were unexpected keys in the checkpoint model loaded: {load_result.unexpected_keys}."
-            )
-    torch_dtype = (
-        args.torch_dtype
-        if args.torch_dtype in ["auto", None]
-        else getattr(torch, args.torch_dtype)
+# ==================================================
+#                   SETUP ARGUMENT
+# ==================================================
+
+@dataclass
+class ModelArguments:
+    model_name_or_path: str = field(
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
-    if args.model_type == "enc_dec":
-        model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path,
-                                    trust_remote_code=True,
-                                    config=config,
-                                    resume_download=True,
-                                    load_in_8bit=args.load_in_8bit, 
-                                    low_cpu_mem_usage=args.low_cpu_mem_usage,
-                                    torch_dtype=torch_dtype,
-                                    cache_dir=args.cache_dir,
-                                    device_map=args.device_map,)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path,
-                                    trust_remote_code=True,
-                                    config=config,
-                                    resume_download=True,
-                                    load_in_8bit=args.load_in_8bit, 
-                                    low_cpu_mem_usage=args.low_cpu_mem_usage,
-                                    torch_dtype=torch_dtype,
-                                    cache_dir=args.cache_dir,
-                                    device_map=args.device_map) #, force_download=True, resume_download=False)
-    
-    if args.lora:
-        assert os.path.exists(args.lora), "Lora config is missing."
-        with open(args.lora, "r") as lora_config_file:
-            lora_config = yaml.safe_load(lora_config_file)
-        
-        lora_config = LoraConfig(
-            r=lora_config["lora_r"],
-            lora_alpha=lora_config["lora_alpha"],
-            lora_dropout=lora_config["lora_dropout"],
-            task_type=lora_config["task_type"],
-            target_modules=lora_config["target_modules"],
-            bias="none",
-        )
-        print(model)
-            
-        if is_train:
-            model.train()
-            if args.load_in_8bit:
-                model = prepare_model_for_int8_training(model)
-            model.enable_input_require_grads()
-            model = get_peft_model(model, lora_config)
-        
-        else:
+    cache_dir: Optional[str] = field(default=None)
+    trust_remote_code: Optional[bool] = field(default=False)
+    # dtype: Optional[str] = field(default="bfloat16")
 
-            if "adapter_model.bin" in os.listdir(args.model_name_or_path):
-                model = PeftModel.from_pretrained(model, 
-                                    args.model_name_or_path, 
-                                    device_map=args.device_map,
-                                    load_in_8bit=args.load_in_8bit, 
-                                    low_cpu_mem_usage= args.low_cpu_mem_usage)
-        
-            elif "pytorch_model.bin" in os.listdir(args.model_name_or_path):
-                if args.load_in_8bit:
-                    model = prepare_model_for_int8_training(model)
-                # Case when the checkpoint saved all the model but not only the adapter
-                state_dict = torch.load(
-                    os.path.join(args.model_name_or_path, "pytorch_model.bin"), 
-                    map_location="cpu"
-                )
-                model = get_peft_model(model, lora_config)
-                load_result = model.load_state_dict(state_dict, False)
-                _issue_warnings_after_load(load_result)
+@dataclass
+class DataArguments:
+    dataset_name_or_path: str = field(default=None, metadata={"help": "Path to the training data."})
+    num_proc: Optional[int] = field(default=None, metadata={"help": "Number of processes."})
+    label_pad_token_id: Optional[int] = field(default=-100)
+    prefix_prompt: Optional[str] = field(default="")
+    postfix_prompt: Optional[str] = field(default="")
+    max_length: Optional[int] = field(
+        default=512,
+        metadata={"help": "Maximum sequence length."}
+    )
 
-    model.config.use_cache = False # silence the warnings. 
-    # Please re-enable for inference!
+
+# ==================================================
+#                     LOAD MODEL
+# ==================================================
+def load_model(args):
+    model = AutoModelForCausalLM.from_pretrained(
+                args.model_name_or_path,
+                trust_remote_code=args.trust_remote_code,
+                # torch_dtype=args.dtype,
+                cache_dir=args.cache_dir)
+
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
     
     return model
 
+# ==================================================
+#              LOAD & PROCESSING DATASET
+# ==================================================
+def load_data(args):
+    try:
+        dataset = datasets.load_dataset(
+            args.dataset_name_or_path,
+            num_proc=args.num_proc,
+        )
+    except Exception: #Not found dataset
+        assert os.path.isfile(args.dataset_name_or_path), "Local path not found"
+        data_files = {'train': args.dataset_name_or_path}
+        dataset = datasets.load_dataset('json', 
+                                        data_files=data_files, 
+                                        num_proc=args.num_proc)
+    
+    return dataset
+
+def preprocess_fn(
+    examples, 
+    args: DataArguments,
+    tokenizer: transformers.PreTrainedTokenizer) -> Dict:
+    prefix_prompt_tokens , postfix_prompt_tokens = [], []
+    if args.prefix_prompt is not None:
+        prefix_prompt_tokens = tokenizer.encode(
+            args.prefix_prompt, 
+            add_special_tokens=False)
+    if args.postfix_prompt is not None:
+        postfix_prompt_tokens = tokenizer.encode(
+            args.postfix_prompt, 
+            add_special_tokens=False)
+    
+    # ============ Customize function ==============
+    bs = len(examples['text'])
+    inputs = [item.strip() for item in examples['text']]
+    
+    max_length = args.max_length - len(prefix_prompt_tokens) - len(postfix_prompt_tokens)
+    model_inputs = tokenizer(inputs,
+                            truncation=True, 
+                            max_length=max_length,
+                            padding=True,
+                            return_tensors=None)
+    
+    for i in range(bs):
+        model_inputs["input_ids"][i] = (prefix_prompt_tokens + 
+                                        model_inputs["input_ids"][i] + 
+                                        postfix_prompt_tokens)
+        model_inputs["attention_mask"][i] = [1] * len(model_inputs["input_ids"][i])
+        assert len(model_inputs["input_ids"][i]) <= args.max_length
+    
+    model_inputs["labels"] = copy.deepcopy(model_inputs["input_ids"])
+            
+    return model_inputs
+
 
 def main():
     torch.cuda.empty_cache()
-    parser = HfArgumentParser((ModelArguments, 
-                               DataTrainingArguments, 
-                               GeneratorArguments,
-                               TrainingArguments,))
-    model_args, data_args, gen_args, training_args = parser.parse_args_into_dataclasses()
+    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    accelerator = Accelerator()
     
-    # ============ Setup logger ==============
-    create_logger()
-    logger = logging.getLogger(__name__)
-    warnings.filterwarnings("ignore")  # Ignore Transformers' caching warning
-    if training_args.should_log:
-        transformers.utils.logging.set_verbosity_info()
-
-    log_level = training_args.get_process_log_level()
-    logger.setLevel(log_level)
+    # ============ Prepare experiment ========
+    save_dir = os.path.join(training_args.output_dir, training_args.run_name)
+    training_args.output_dir = save_dir
+    logging.basicConfig(level=logging.INFO,
+                        handlers=[
+                            logging.FileHandler(os.path.join(save_dir, "exp.log")),
+                            logging.StreamHandler()
+                        ])
     
     # ============ Load dataset ==============
-    if data_args.dataset_name_or_path is not None:
-        dataset = datasets.load_dataset(
-            data_args.dataset_name_or_path,
-            cache_dir=model_args.cache_dir, 
-            num_proc=data_args.num_proc,
-        )
-    else:
-        assert data_args.train_file is not None
-        
-        data_files = {'train': data_args.train_file}
-        if data_args.validation_file:
-            data_files['valid'] = data_args.validation_file
-        
-        dataset = datasets.load_dataset('json', 
-                                        data_files=data_files, 
-                                        num_proc=data_args.num_proc, 
-                                        cache_dir=model_args.cache_dir)
+    dataset = load_data(data_args)
     
-    # ============ Load & setup tokenizer ==============
-    config = AutoConfig.from_pretrained(model_args.model_base, 
-                                        trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path,
-                            cache_dir=model_args.cache_dir,
-                            padding_side=data_args.padding_side)
+    # ============ Load & setup tokenizer ====
+    # config = AutoConfig.from_pretrained(model_args.model_base)
+    tokenizer = AutoTokenizer.from_pretrained(
+                        model_args.model_name_or_path,
+                        cache_dir=model_args.cache_dir,
+                        padding_side="right",
+                        trust_remote_code=model_args.trust_remote_code)
+    
+    logger.info(f"PAD Token: {tokenizer.pad_token}")
+    logger.info(f"BOS Token: {tokenizer.bos_token}")
+    logger.info(f"EOS Token: {tokenizer.eos_token}")
+    
+    if tokenizer.pad_token_id is None:
+        logger.info("Tokenizer does not has pad token. Set the pad_token to eos_token.")
+        tokenizer.pad_token_id = tokenizer.eos_token_id
     
     # ============ Load model ==============
-    set_seed(training_args.seed)  #  Set seed efore initializing model
-    model = load_model(model_args, config)
-    smart_tokenizer_and_embedding_resize(special_tokens=data_args.new_tokens, 
-                                        tokenizer=tokenizer, 
-                                        model=model)
-
-    # path = "/datadrive05/dungnm31/Exp/phi15/checkpoint-3450/pytorch_model.bin"
-    # model.load_state_dict(torch.load(path))
-    model = model.cuda()
-    # print("model", model.device)
+    set_seed(42)  #  Set seed efore initializing model
+    model = load_model(model_args)
     
-    # Set use_cache to False to use gradient checkpointing
-    if training_args.gradient_checkpointing:
-        model.config.use_cache = False
+    tokenized_dataset = dataset.map(
+        preprocess_fn, 
+        batched=True,
+        batch_size=3000, 
+        num_proc=data_args.num_proc,
+        remove_columns=dataset["train"].column_names,
+        load_from_cache_file=True,
+        desc="Running Encoding",
+        fn_kwargs={
+            "args": data_args,
+            "tokenizer": tokenizer, 
+        }
+    )
+    
+    train_dataset = tokenized_dataset["train"].shuffle(seed=42)
+    # eval_dataset = tokenized_dataset["eval"].shuffle(seed=42)
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True,
+                                            max_length=data_args.max_length)
+    ds_loader = DataLoader(tokenized_dataset,
+                           collate_fn=data_collator,
+                           batch_size=training_args.per_device_train_batch_size,
+                           pin_memory=True, shuffle= False)
 
-    if training_args.deepspeed is None:
-        display_params(model)
-        
-    if training_args.do_train:
-        trainer_extra_kwargs = {}
-        if model_args.lora:
-            trainer_extra_kwargs["callbacks"] = [SavePeftModelCallback]
-            # trainer.evaluate(tokenized_dataset["test"])
-            old_state_dict = model.state_dict
-            model.state_dict = (
-                lambda self, *_, **__: peft.get_peft_model_state_dict(
-                    self, old_state_dict()
-                )
-            ).__get__(model, type(model))
+    model, ds_loader = accelerator.prepare(model, ds_loader)
+    
+    if training_args.local_rank == 0:
+        torch.distributed.barrier()
+        logger.info(f"Training dataset samples: {len(train_dataset)}")
+        for index in random.sample(range(len(train_dataset)), 3):
+            logger.info(f"Sample {index} of the training set: \n{train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
+            logger.info(f"Sample {index} of the training set: \n{tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
+    
+    trainer = Trainer(model=model, 
+                      args=training_args,
+                      tokenizer=tokenizer,
+                    #   data_collator=data_collator,
+                      train_dataset=ds_loader,
+                      eval_dataset=None, #eval_dataset,
+                      compute_metrics=None)
 
-        train(model=model, 
-              dataset=dataset, 
-              tokenizer=tokenizer, 
-              data_args=data_args, 
-              training_args=training_args,
-              **trainer_extra_kwargs)
-        
-    elif training_args.do_eval:
-        generation(model=model, 
-                   dataset=dataset, 
-                   tokenizer=tokenizer, 
-                   data_args=data_args,
-                   model_args=model_args,
-                   gen_args=gen_args,
-                   output_dir=training_args.output_dir)
-        
-    else:
-        raise NotImplemented("Inference function not implemented")
+    trainer.train()
+    trainer.save_state()
+    # ============ Save model state ==============
+    state_dict = trainer.model.state_dict()
+    if trainer.args.should_save:
+        cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+        del state_dict
+        trainer._save(training_args.output_dir, state_dict=cpu_state_dict)  # noqa
 
 
 if __name__ == "__main__":

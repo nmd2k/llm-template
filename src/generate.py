@@ -43,7 +43,7 @@ class ModelArguments:
     cache_dir: Optional[str] = field(
         default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
     )
-    trush_remote_code: Optional[bool] = field(
+    trust_remote_code: Optional[bool] = field(
         default=False, metadata={"help": "Whether to trush remote code"}
     )
     prefix_prompt: Optional[str] = field(
