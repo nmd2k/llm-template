@@ -27,7 +27,7 @@ accelerate launch \
     --save_total_limit 5 \
     --max_length 1024 \
     --output_dir /datadrive05/dungnm31/llm_template/checkpoints \
-    --bf16 \
-    --cache_dir /datadrive05/.cache
+    --cache_dir /datadrive05/.cache \
+    # --remove_unused_columns False
     # --gradient_checkpointing \
     # --load_best_model_at_end \

@@ -124,10 +124,9 @@ def preprocess_fn(
 
 
 def main():
-    torch.cuda.empty_cache()
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    accelerator = Accelerator()
+    # accelerator = Accelerator()
     
     # ============ Prepare experiment ========
     save_dir = os.path.join(training_args.output_dir, training_args.run_name)
@@ -173,12 +172,16 @@ def main():
             "tokenizer": tokenizer, 
         }
     )
+    train_dataset = tokenized_dataset['train']
     
-    train_dataset = tokenized_dataset["train"].shuffle(seed=42)
-    # eval_dataset = tokenized_dataset["eval"].shuffle(seed=42)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
-
-    model, train_dataset = accelerator.prepare(model, train_dataset)
+    # train_dataset = tokenized_dataset["train"].shuffle(seed=42)
+    # eval_dataset = tokenized_dataset["eval"].shuffle(seed=42)
+    # ds_loader = DataLoader(train_dataset,
+    #                        collate_fn=data_collator,
+    #                        batch_size=training_args.per_device_train_batch_size,
+    #                        pin_memory=True, shuffle=False,
+    #                        sampler=DistributedSampler(train_dataset))
     
     logger.info(f"Training dataset samples: {len(train_dataset)}")
     if training_args.local_rank == 0:
@@ -187,23 +190,25 @@ def main():
         for index in random.sample(range(len(train_dataset)), 3):
             logger.info(f"Sample {index} of the training set: \n{train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
             logger.info(f"Sample {index} of the training set: \n{tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
-    
+
+    logger.info("Start training ...")
     trainer = Trainer(model=model, 
                       args=training_args,
                       tokenizer=tokenizer,
                       data_collator=data_collator,
                       train_dataset=train_dataset,
+                      eval_dataset=None,
                       compute_metrics=None)
-    # model.config.use_cache = False
+    model.config.use_cache = False
 
     trainer.train()
     trainer.save_state()
-    # ============ Save model state ==============
-    state_dict = trainer.model.state_dict()
-    if trainer.args.should_save:
-        cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
-        del state_dict
-        trainer._save(training_args.output_dir, state_dict=cpu_state_dict)  # noqa
+    # # ============ Save model state ==============
+    # state_dict = trainer.model.state_dict()
+    # if trainer.args.should_save:
+    #     cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+    #     del state_dict
+    #     trainer._save(training_args.output_dir, state_dict=cpu_state_dict)  # noqa
 
 
 if __name__ == "__main__":
