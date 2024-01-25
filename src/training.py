@@ -5,7 +5,7 @@ import warnings
 import random
 import copy
 
-from typing import Optional, Dict
+from typing import Optional, Dict, Union, List, Any
 from dataclasses import dataclass, field
 
 import torch
@@ -15,7 +15,8 @@ from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from transformers import HfArgumentParser, TrainingArguments, \
     AutoModelForCausalLM, AutoTokenizer, AutoConfig, \
-    DataCollatorWithPadding, Trainer, \
+    DataCollatorForLanguageModeling, \
+    Trainer, \
     set_seed
 
 # from peft import LoraConfig, get_peft_model, \
@@ -24,6 +25,7 @@ from transformers import HfArgumentParser, TrainingArguments, \
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")  # Ignore Transformers' caching warning
+IGNORE_INDEX = -100
 
 # ==================================================
 #                   SETUP ARGUMENT
@@ -121,11 +123,71 @@ def preprocess_fn(
     return model_inputs
 
 
+
+@dataclass
+class DataCollatorWithPadding:
+    tokenizer: transformers.PreTrainedTokenizerBase
+    padding: Union[bool, str, transformers.utils.PaddingStrategy] = True
+    max_length: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
+    label_pad_token_id: int = -100
+    return_tensors: str = "pt"
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        label_name = "label" if "label" in features[0].keys() else "labels"
+        labels = [feature[label_name] for feature in features] if label_name in features[0].keys() else None
+
+        padding_features = [{k: v for k, v in feature.items() if k != label_name} for feature in features]
+
+        
+        batch = self.tokenizer.pad(
+            padding_features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors=self.return_tensors,
+        )
+
+        if labels is None:
+            return batch
+
+        sequence_length = batch["input_ids"].shape[1]
+        padding_side = self.tokenizer.padding_side
+
+        def to_list(tensor_or_iterable):
+            if isinstance(tensor_or_iterable, torch.Tensor):
+                return tensor_or_iterable.tolist()
+            return list(tensor_or_iterable)
+
+        if padding_side == "right":
+            batch[label_name] = [
+                to_list(label) + [self.label_pad_token_id] * (sequence_length - len(label)) for label in labels
+            ]
+        else:
+            batch[label_name] = [
+                [self.label_pad_token_id] * (sequence_length - len(label)) + to_list(label) for label in labels
+            ]
+
+        print(len(batch))
+        print(batch["input_ids"])
+        batch[label_name] = torch.tensor(batch[label_name], dtype=torch.int64)
+
+        if "label" in batch:
+            batch["labels"] = batch["label"]
+            del batch["label"]
+        if "label_ids" in batch:
+            batch["labels"] = batch["label_ids"]
+            del batch["label_ids"]
+            
+        return batch
+
+
+
 def main():
     torch.cuda.empty_cache()
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    accelerator = Accelerator()
+    # accelerator = Accelerator()
     
     # ============ Prepare experiment ========
     save_dir = os.path.join(training_args.output_dir, training_args.run_name)
@@ -162,7 +224,6 @@ def main():
     tokenized_dataset = dataset.map(
         preprocess_fn, 
         batched=True,
-        batch_size=3000, 
         num_proc=data_args.num_proc,
         remove_columns=dataset["train"].column_names,
         load_from_cache_file=True,
@@ -175,29 +236,28 @@ def main():
     
     train_dataset = tokenized_dataset["train"].shuffle(seed=42)
     # eval_dataset = tokenized_dataset["eval"].shuffle(seed=42)
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True,
-                                            max_length=data_args.max_length)
-    ds_loader = DataLoader(tokenized_dataset,
-                           collate_fn=data_collator,
-                           batch_size=training_args.per_device_train_batch_size,
-                           pin_memory=True, shuffle= False)
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer,
+                                            padding=True,
+                                            label_pad_token_id=IGNORE_INDEX,
+                                            pad_to_multiple_of=8)
+    print(data_collator)
 
-    model, ds_loader = accelerator.prepare(model, ds_loader)
+    # model, ds_loader = accelerator.prepare(model, ds_loader)
     
-    if training_args.local_rank == 0:
-        torch.distributed.barrier()
-        logger.info(f"Training dataset samples: {len(train_dataset)}")
-        for index in random.sample(range(len(train_dataset)), 3):
-            logger.info(f"Sample {index} of the training set: \n{train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
-            logger.info(f"Sample {index} of the training set: \n{tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
+    # if training_args.local_rank == 0:
+    #     torch.distributed.barrier()
+    #     logger.info(f"Training dataset samples: {len(train_dataset)}")
+    #     for index in random.sample(range(len(train_dataset)), 3):
+    #         logger.info(f"Sample {index} of the training set: \n{train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
+    #         logger.info(f"Sample {index} of the training set: \n{tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
     
     trainer = Trainer(model=model, 
                       args=training_args,
                       tokenizer=tokenizer,
-                    #   data_collator=data_collator,
-                      train_dataset=ds_loader,
-                      eval_dataset=None, #eval_dataset,
+                      data_collator=data_collator,
+                      train_dataset=tokenized_dataset['train'],
                       compute_metrics=None)
+    model.config.use_cache = False
 
     trainer.train()
     trainer.save_state()
