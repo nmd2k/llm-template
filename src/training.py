@@ -4,19 +4,26 @@ import logging
 import warnings
 import random
 import copy
+import tqdm
 
 from typing import Optional, Dict, Union, List, Any
 from dataclasses import dataclass, field
 
 import torch
+from torch.optim import Adam
+from torch.utils.data import DataLoader
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+
 import datasets
 import transformers
 from accelerate import Accelerator
-from torch.utils.data import DataLoader
 from transformers import HfArgumentParser, TrainingArguments, \
     AutoModelForCausalLM, AutoTokenizer, AutoConfig, \
     DataCollatorForLanguageModeling, DataCollatorWithPadding, \
-    Trainer, \
+    Trainer, get_scheduler, \
     set_seed
 
 # from peft import LoraConfig, get_peft_model, \
@@ -26,6 +33,13 @@ from transformers import HfArgumentParser, TrainingArguments, \
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")  # Ignore Transformers' caching warning
 IGNORE_INDEX = -100
+
+
+def ddp_setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
 # ==================================================
 #                   SETUP ARGUMENT
@@ -65,6 +79,8 @@ def load_model(args):
 
     # if torch.__version__ >= "2" and sys.platform != "win32":
     #     model = torch.compile(model)
+    
+    model = DDP(model, device_ids=[int(os.environ["LOCAL_RANK"])])
     
     return model
 
@@ -123,21 +139,8 @@ def preprocess_fn(
     return model_inputs
 
 
-def main():
-    torch.cuda.empty_cache()
-    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    accelerator = Accelerator()
-    
-    # ============ Prepare experiment ========
-    save_dir = os.path.join(training_args.output_dir, training_args.run_name)
-    training_args.output_dir = save_dir
-    logging.basicConfig(level=logging.INFO,
-                        handlers=[
-                            logging.FileHandler(os.path.join(save_dir, "exp.log")),
-                            logging.StreamHandler()
-                        ])
-    
+def main(rank: int, world_size: int, model_args, data_args, training_args):
+    ddp_setup(rank, world_size)
     # ============ Load dataset ==============
     dataset = load_data(data_args)
     
@@ -175,36 +178,114 @@ def main():
     )
     
     train_dataset = tokenized_dataset["train"].shuffle(seed=42)
-    # eval_dataset = tokenized_dataset["eval"].shuffle(seed=42)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
+    # eval_dataset = tokenized_dataset["eval"].shuffle(seed=42)
+    ds_loader = DataLoader(train_dataset,
+                           collate_fn=data_collator,
+                           batch_size=training_args.per_device_train_batch_size,
+                           pin_memory=True, shuffle=False,
+                           sampler=DistributedSampler(train_dataset))
+    
+    # logger.info(f"Training dataset samples: {len(train_dataset)}")
+    # if training_args.local_rank == 0:
+    #     torch.distributed.barrier()
+    #     logger.info(f"Training dataset samples: {len(train_dataset)}")
+    #     for index in random.sample(range(len(train_dataset)), 3):
+    #         logger.info(f"Sample {index} of the training set: \n{train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
+    #         logger.info(f"Sample {index} of the training set: \n{tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
+    
+    num_training_steps = int(training_args.num_train_epochs * len(train_dataset))
+    optimizer = Adam(model.parameters(), lr=training_args.learning_rate)
+    lr_scheduler = get_scheduler(name="linear",
+                                 optimizer=optimizer,
+                                 num_warmup_steps=0,
+                                 num_training_steps=num_training_steps)
+    
+    logger.info("Prepare model & optimizer ...")
+    # model, ds_loader, optimizer, lr_scheduler = accelerator.prepare(model, 
+    #                                                                 ds_loader, 
+    #                                                                 optimizer,
+    #                                                                 lr_scheduler)
+    logger.info("Start training ...")
+    progress_bar = tqdm.tqdm(range(num_training_steps))
+    
+    gpu_id = int(os.environ["LOCAL_RANK"])
+    model.train()
+    for epoch in range(int(training_args.num_train_epochs)):
+        ds_loader.sampler.set_epoch(epoch)
+        for step, batch in enumerate(ds_loader):
+            source, att_mask, targets = batch
+            source = source.to(gpu_id)
+            att_mask = att_mask.to(gpu_id)
+            targets = targets.to(gpu_id)
+            
+            outputs = model(**batch)
+            loss = outputs.loss
+            
+            # accelerator.backward(loss)
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            
+            progress_bar.update(1)
+            
+            if step % 10 == 0:
+                logger.info(f"Epoch: {epoch}, step: {step}, loss: {loss.item()}")
+    
+    
+        # for step, batch in enumerate(train_dataset):
+        #     outputs = model(**batch)
+        #     loss = outputs.loss
+        #     loss = loss / training_args.gradient_accumulation_steps
+        #     accelerator.backward(loss)
+        #     if step % training_args.gradient_accumulation_steps == 0 or step == len(train_dataset) - 1:
+        #         optimizer.step()
+        #         lr_scheduler.step()
+        #         optimizer.zero_grad()
 
-    model, train_dataset = accelerator.prepare(model, train_dataset)
+        # if training_args.local_rank == 0:
+        #     accelerator.wait_for_everyone()
+        #     unwrapped_model = accelerator.unwrap_model(model)
+        #     unwrapped_model.save_pretrained(save_dir, save_function=accelerator.save)
+        #     if epoch % 10 == 0:
+        #         accelerator.wait_for_everyone()
+        #         unwrapped_model = accelerator.unwrap_model(model)
+        #         unwrapped_model.save
     
-    logger.info(f"Training dataset samples: {len(train_dataset)}")
-    if training_args.local_rank == 0:
-        torch.distributed.barrier()
-        logger.info(f"Training dataset samples: {len(train_dataset)}")
-        for index in random.sample(range(len(train_dataset)), 3):
-            logger.info(f"Sample {index} of the training set: \n{train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
-            logger.info(f"Sample {index} of the training set: \n{tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
     
-    trainer = Trainer(model=model, 
-                      args=training_args,
-                      tokenizer=tokenizer,
-                      data_collator=data_collator,
-                      train_dataset=train_dataset,
-                      compute_metrics=None)
+    # trainer = Trainer(model=model, 
+    #                   args=training_args,
+    #                   tokenizer=tokenizer,
+    #                   data_collator=data_collator,
+    #                   train_dataset=train_dataset,
+    #                   compute_metrics=None)
     # model.config.use_cache = False
 
-    trainer.train()
-    trainer.save_state()
-    # ============ Save model state ==============
-    state_dict = trainer.model.state_dict()
-    if trainer.args.should_save:
-        cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
-        del state_dict
-        trainer._save(training_args.output_dir, state_dict=cpu_state_dict)  # noqa
+    # trainer.train()
+    # trainer.save_state()
+    # # ============ Save model state ==============
+    # state_dict = trainer.model.state_dict()
+    # if trainer.args.should_save:
+    #     cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+    #     del state_dict
+    #     trainer._save(training_args.output_dir, state_dict=cpu_state_dict)  # noqa
 
 
 if __name__ == "__main__":
-    main()
+    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    # accelerator = Accelerator()
+    
+    # ============ Prepare experiment ========
+    save_dir = os.path.join(training_args.output_dir, training_args.run_name)
+    training_args.output_dir = save_dir
+    logging.basicConfig(level=logging.INFO,
+                        handlers=[
+                            logging.FileHandler(os.path.join(save_dir, "exp.log")),
+                            logging.StreamHandler()
+                        ])
+    world_size = torch.cuda.device_count()
+    
+    mp.spawn(main, args=(world_size, model_args, data_args, training_args), 
+                   nprocs=world_size)
