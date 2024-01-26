@@ -31,29 +31,14 @@ DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "<|endoftext|>"
 DEFAULT_BOS_TOKEN = "<|endoftext|>"
 DEFAULT_UNK_TOKEN = "<|endoftext|>"
-PROMPT_DICT = {
-    "prompt_input": (
-        "Below is an instruction that describes a task, paired with an input that provides further context. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
-    ),
-    "prompt_no_input": (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response:"
-    ),
-}
-
 
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="bigcode/starcoder")
 
-
 @dataclass
 class DataArguments:
-    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
-
+    dataset_name_or_path: str = field(default=None, metadata={"help": "Path to the training data."})
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -157,14 +142,6 @@ class DataCollatorForSupervisedDataset(object):
         )
 
 def train_tokenize_function(examples, tokenizer):
-    # # prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
-    # if 'input' in examples:
-    #     sources = [
-    #         prompt_input.format_map(dict(instruction=instruction, input=input)) if input != "" \
-    #         else prompt_no_input.format_map(dict(instruction=instruction)) \
-    #         for instruction, input in zip(examples['instruction'], examples['input']) 
-    #     ]
-    # else:
     sources = examples['text']
     targets = [f"{output}{tokenizer.eos_token}" for output in examples['text']]
     data_dict = preprocess(sources, targets, tokenizer)
@@ -229,7 +206,7 @@ def train():
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     data_module = dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
-    #Tell Trainer not to attempt DataParallel
+    # Tell Trainer not to attempt DataParallel
     model.is_parallelizable = True
     model.model_parallel = True
 

@@ -5,7 +5,7 @@ import warnings
 import random
 import copy
 
-from typing import Optional, Dict, Union, List, Any
+from typing import Optional, Dict, Union, List, Any, Sequence
 from dataclasses import dataclass, field
 
 import torch
@@ -38,6 +38,7 @@ class ModelArguments:
     )
     cache_dir: Optional[str] = field(default=None)
     trust_remote_code: Optional[bool] = field(default=False)
+    load_in_8bit: Optional[bool] = field(default=False)
     # dtype: Optional[str] = field(default="bfloat16")
 
 @dataclass
@@ -60,6 +61,7 @@ def load_model(args):
     model = AutoModelForCausalLM.from_pretrained(
                 args.model_name_or_path,
                 trust_remote_code=args.trust_remote_code,
+                load_in_8bit=args.load_in_8bit,
                 # torch_dtype=args.dtype,
                 cache_dir=args.cache_dir)
 
@@ -81,6 +83,7 @@ def load_data(args):
         assert os.path.isfile(args.dataset_name_or_path), "Local path not found"
         data_files = {'train': args.dataset_name_or_path}
         dataset = datasets.load_dataset('json', 
+                                        split="train",
                                         data_files=data_files, 
                                         num_proc=args.num_proc)
     
@@ -108,8 +111,8 @@ def preprocess_fn(
     model_inputs = tokenizer(inputs,
                             truncation=True, 
                             max_length=max_length,
-                            padding="max_length")
-                            # return_tensors='pt')
+                            # padding=True
+                            )
     
     for i in range(bs):
         model_inputs["input_ids"][i] = (prefix_prompt_tokens + 
@@ -122,6 +125,25 @@ def preprocess_fn(
     
     return model_inputs
 
+@dataclass
+class DataCollatorForSupervisedDataset(object):
+    """Collate examples for supervised fine-tuning."""
+
+    tokenizer: transformers.PreTrainedTokenizer
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        input_ids = [torch.tensor(x) for x in input_ids]
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+        labels = [torch.tensor(x) for x in labels]
+        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        return dict(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+        )
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
@@ -131,6 +153,7 @@ def main():
     # ============ Prepare experiment ========
     save_dir = os.path.join(training_args.output_dir, training_args.run_name)
     training_args.output_dir = save_dir
+    os.makedirs(save_dir, exist_ok=True)
     logging.basicConfig(level=logging.INFO,
                         handlers=[
                             logging.FileHandler(os.path.join(save_dir, "exp.log")),
@@ -146,6 +169,7 @@ def main():
                         model_args.model_name_or_path,
                         cache_dir=model_args.cache_dir,
                         padding_side="right",
+                        model_max_length=data_args.max_length,
                         trust_remote_code=model_args.trust_remote_code)
     
     logger.info(f"PAD Token: {tokenizer.pad_token}")
@@ -160,11 +184,14 @@ def main():
     set_seed(42)  #  Set seed efore initializing model
     model = load_model(model_args)
     
+    if training_args.local_rank > 0: 
+        torch.distributed.barrier()
+    
     tokenized_dataset = dataset.map(
         preprocess_fn, 
         batched=True,
         num_proc=data_args.num_proc,
-        remove_columns=dataset["train"].column_names,
+        remove_columns=dataset.column_names,
         load_from_cache_file=True,
         desc="Running Encoding",
         fn_kwargs={
@@ -172,9 +199,11 @@ def main():
             "tokenizer": tokenizer, 
         }
     )
-    train_dataset = tokenized_dataset['train']
+    train_dataset = tokenized_dataset
+    if training_args.local_rank == 0:
+        torch.distributed.barrier()
     
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     # train_dataset = tokenized_dataset["train"].shuffle(seed=42)
     # eval_dataset = tokenized_dataset["eval"].shuffle(seed=42)
     # ds_loader = DataLoader(train_dataset,
@@ -185,13 +214,15 @@ def main():
     
     logger.info(f"Training dataset samples: {len(train_dataset)}")
     if training_args.local_rank == 0:
-        torch.distributed.barrier()
         logger.info(f"Training dataset samples: {len(train_dataset)}")
         for index in random.sample(range(len(train_dataset)), 3):
             logger.info(f"Sample {index} of the training set: \n{train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
             logger.info(f"Sample {index} of the training set: \n{tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
 
     logger.info("Start training ...")
+    model.is_parallelizable = True
+    model.model_parallel = True
+    
     trainer = Trainer(model=model, 
                       args=training_args,
                       tokenizer=tokenizer,
@@ -199,6 +230,7 @@ def main():
                       train_dataset=train_dataset,
                       eval_dataset=None,
                       compute_metrics=None)
+    
     model.config.use_cache = False
 
     trainer.train()
