@@ -38,7 +38,7 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    dataset_name_or_path: str = field(default=None, metadata={"help": "Path to the training data."})
+    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
