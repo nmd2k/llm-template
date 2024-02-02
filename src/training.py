@@ -169,9 +169,6 @@ def main():
                             logging.StreamHandler()
                         ])
     
-    # ============ Load dataset ==============
-    dataset = load_data(data_args)
-    
     # ============ Load & setup tokenizer ====
     # config = AutoConfig.from_pretrained(model_args.model_base)
     tokenizer = AutoTokenizer.from_pretrained(
@@ -195,6 +192,9 @@ def main():
     
     if training_args.local_rank > 0: 
         torch.distributed.barrier()
+        
+    # ============ Load dataset ==============
+    dataset = load_data(data_args)
     
     tokenized_dataset = dataset.map(
         preprocess_fn, 
@@ -228,6 +228,8 @@ def main():
             logger.info(f"Sample {index} of the training set: \n{train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
             logger.info(f"Sample {index} of the training set: \n{tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
 
+
+    # ============ Training ==============
     logger.info("Start training ...")
     model.is_parallelizable = True
     model.model_parallel = True
