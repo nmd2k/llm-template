@@ -1,35 +1,29 @@
 import os
-import sys
+import copy
+import random
 import logging
 import warnings
-import random
-import copy
-
 from typing import Optional, Dict, Union, List, Any, Sequence
 from dataclasses import dataclass, field
 
 import torch
 import datasets
 import transformers
-from accelerate import Accelerator
-from torch.utils.data import DataLoader
-from transformers import HfArgumentParser, TrainingArguments, \
-    AutoModelForCausalLM, AutoTokenizer, AutoConfig, \
-    DataCollatorForLanguageModeling, DataCollatorWithPadding, \
-    Trainer, \
-    set_seed
+from transformers import TrainingArguments, HfArgumentParser, TrainingArguments
+    
 
-# from peft import LoraConfig, get_peft_model, \
-#     prepare_model_for_int8_training, PeftModel, \
-#     get_peft_model_state_dict
+# from transformers import , \
+#     AutoModelForCausalLM, AutoTokenizer, AutoConfig, \
+#     DataCollatorForLanguageModeling, DataCollatorWithPadding, \
+#     Trainer, \
+#     set_seed
+from trl import SFTTrainer
+from unsloth import FastLanguageModel
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")  # Ignore Transformers' caching warning
 IGNORE_INDEX = -100
 
-# ==================================================
-#                   SETUP ARGUMENT
-# ==================================================
 
 @dataclass
 class ModelArguments:
@@ -55,22 +49,6 @@ class DataArguments:
 
 
 # ==================================================
-#                     LOAD MODEL
-# ==================================================
-def load_model(args):
-    model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
-                trust_remote_code=args.trust_remote_code,
-                load_in_8bit=args.load_in_8bit,
-                # torch_dtype=args.dtype,
-                cache_dir=args.cache_dir)
-
-    # if torch.__version__ >= "2" and sys.platform != "win32":
-    #     model = torch.compile(model)
-    
-    return model
-
-# ==================================================
 #              LOAD & PROCESSING DATASET
 # ==================================================
 def load_data(args):
@@ -86,8 +64,7 @@ def load_data(args):
                                         split="train",
                                         data_files=data_files, 
                                         num_proc=args.num_proc)
-    
-    return dataset
+
 
 def preprocess_fn(
     examples, 
@@ -152,12 +129,11 @@ class DataCollatorForSupervisedDataset(object):
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
-
+        
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    # accelerator = Accelerator()
     
     # ============ Prepare experiment ========
     save_dir = os.path.join(training_args.output_dir, training_args.run_name)
@@ -172,30 +148,6 @@ def main():
     # ============ Load dataset ==============
     dataset = load_data(data_args)
     
-    # ============ Load & setup tokenizer ====
-    # config = AutoConfig.from_pretrained(model_args.model_base)
-    tokenizer = AutoTokenizer.from_pretrained(
-                        model_args.model_name_or_path,
-                        cache_dir=model_args.cache_dir,
-                        padding_side="right",
-                        model_max_length=data_args.max_length,
-                        trust_remote_code=model_args.trust_remote_code)
-    
-    logger.info(f"PAD Token: {tokenizer.pad_token}")
-    logger.info(f"BOS Token: {tokenizer.bos_token}")
-    logger.info(f"EOS Token: {tokenizer.eos_token}")
-    
-    if tokenizer.pad_token_id is None:
-        logger.info("Tokenizer does not has pad token. Set the pad_token to eos_token.")
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    
-    # ============ Load model ==============
-    set_seed(42)  #  Set seed efore initializing model
-    model = load_model(model_args)
-    
-    if training_args.local_rank > 0: 
-        torch.distributed.barrier()
-    
     tokenized_dataset = dataset.map(
         preprocess_fn, 
         batched=True,
@@ -208,18 +160,10 @@ def main():
             "tokenizer": tokenizer, 
         }
     )
-    # train_dataset = tokenized_dataset
-    if training_args.local_rank == 0:
-        torch.distributed.barrier()
     
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    train_dataset = tokenized_dataset.shuffle(seed=42)
+    train_dataset = tokenized_dataset["train"].shuffle(seed=42)
     # eval_dataset = tokenized_dataset["eval"].shuffle(seed=42)
-    # ds_loader = DataLoader(train_dataset,
-    #                        collate_fn=data_collator,
-    #                        batch_size=training_args.per_device_train_batch_size,
-    #                        pin_memory=True, shuffle=False,
-    #                        sampler=DistributedSampler(train_dataset))
     
     logger.info(f"Training dataset samples: {len(train_dataset)}")
     if training_args.local_rank == 0:
@@ -228,28 +172,40 @@ def main():
             logger.info(f"Sample {index} of the training set: \n{train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
             logger.info(f"Sample {index} of the training set: \n{tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
 
-    logger.info("Start training ...")
-    model.is_parallelizable = True
-    model.model_parallel = True
-    
-    trainer = Trainer(model=model, 
-                      args=training_args,
-                      tokenizer=tokenizer,
-                      data_collator=data_collator,
-                      train_dataset=train_dataset,
-                      eval_dataset=None,
-                      compute_metrics=None)
-    
-    model.config.use_cache = False
 
+    # ============ Load model ============
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name = model_args.model_name_or_path,
+        max_seq_length = data_args.max_length,
+        dtype = None, # None for auto detection
+        # load_in_4bit = True, # Use 4bit quantization to reduce memory usage. Can be False
+        # token = "hf_...", # use one if using gated models like meta-llama/Llama-2-7b-hf
+    )
+
+    # Do model patching and add fast LoRA weights
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r = 16,
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj",],
+        lora_alpha = 16,
+        lora_dropout = 0, # Dropout = 0 is currently optimized
+        bias = "none",    # Bias = "none" is currently optimized
+        use_gradient_checkpointing = True,
+        random_state = 3407,
+    )
+
+    logger.info("Start training ...")
+    trainer = SFTTrainer(
+        model = model,
+        args = training_args,
+        train_dataset = dataset,
+        data_collator=data_collator,
+        # dataset_text_field = "text",
+        max_seq_length = data_args.max_length,
+    )
     trainer.train()
     trainer.save_state()
-    # # ============ Save model state ==============
-    # state_dict = trainer.model.state_dict()
-    # if trainer.args.should_save:
-    #     cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
-    #     del state_dict
-    #     trainer._save(training_args.output_dir, state_dict=cpu_state_dict)  # noqa
 
 
 if __name__ == "__main__":
