@@ -64,7 +64,8 @@ def load_data(args):
                                         split="train",
                                         data_files=data_files, 
                                         num_proc=args.num_proc)
-
+    
+    return dataset
 
 def preprocess_fn(
     examples, 
@@ -145,34 +146,6 @@ def main():
                             logging.StreamHandler()
                         ])
     
-    # ============ Load dataset ==============
-    dataset = load_data(data_args)
-    
-    tokenized_dataset = dataset.map(
-        preprocess_fn, 
-        batched=True,
-        num_proc=data_args.num_proc,
-        remove_columns=dataset.column_names,
-        load_from_cache_file=True,
-        desc="Running Encoding",
-        fn_kwargs={
-            "args": data_args,
-            "tokenizer": tokenizer, 
-        }
-    )
-    
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    train_dataset = tokenized_dataset["train"].shuffle(seed=42)
-    # eval_dataset = tokenized_dataset["eval"].shuffle(seed=42)
-    
-    logger.info(f"Training dataset samples: {len(train_dataset)}")
-    if training_args.local_rank == 0:
-        logger.info(f"Training dataset samples: {len(train_dataset)}")
-        for index in random.sample(range(len(train_dataset)), 3):
-            logger.info(f"Sample {index} of the training set: \n{train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
-            logger.info(f"Sample {index} of the training set: \n{tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
-
-
     # ============ Load model ============
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = model_args.model_name_or_path,
@@ -194,7 +167,35 @@ def main():
         use_gradient_checkpointing = True,
         random_state = 3407,
     )
+    
+    # ============ Load dataset ==============
+    dataset = load_data(data_args)
+    
+    tokenized_dataset = dataset.map(
+        preprocess_fn, 
+        batched=True,
+        num_proc=data_args.num_proc,
+        remove_columns=dataset.column_names,
+        load_from_cache_file=True,
+        desc="Running Encoding",
+        fn_kwargs={
+            "args": data_args,
+            "tokenizer": tokenizer, 
+        }
+    )
+    
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    train_dataset = tokenized_dataset.shuffle(seed=42)
+    # eval_dataset = tokenized_dataset["eval"].shuffle(seed=42)
+    
+    logger.info(f"Training dataset samples: {len(train_dataset)}")
+    if training_args.local_rank == 0:
+        logger.info(f"Training dataset samples: {len(train_dataset)}")
+        for index in random.sample(range(len(train_dataset)), 3):
+            logger.info(f"Sample {index} of the training set: \n{train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
+            logger.info(f"Sample {index} of the training set: \n{tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
 
+    # ============ Start training ==============
     logger.info("Start training ...")
     trainer = SFTTrainer(
         model = model,

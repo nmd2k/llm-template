@@ -3,72 +3,24 @@ import sys
 import logging
 import warnings
 import random
-import copy
-
-from typing import Optional, Dict, Union, List, Any, Sequence
-from dataclasses import dataclass, field
 
 import torch
 import datasets
-import transformers
-from accelerate import Accelerator
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from transformers import HfArgumentParser, TrainingArguments, \
     AutoModelForCausalLM, AutoTokenizer, AutoConfig, \
     DataCollatorForLanguageModeling, DataCollatorWithPadding, \
     Trainer, \
     set_seed
-
-# from peft import LoraConfig, get_peft_model, \
-#     prepare_model_for_int8_training, PeftModel, \
-#     get_peft_model_state_dict
+    
+from utils.train_args import ModelArguments, DataArguments
+from utils.data_preprocessor import preprocess_fn
+from utils.data_collator import DataCollatorForSupervisedDataset
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")  # Ignore Transformers' caching warning
 IGNORE_INDEX = -100
 
-# ==================================================
-#                   SETUP ARGUMENT
-# ==================================================
-
-@dataclass
-class ModelArguments:
-    model_name_or_path: str = field(
-        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
-    )
-    cache_dir: Optional[str] = field(default=None)
-    trust_remote_code: Optional[bool] = field(default=False)
-    load_in_8bit: Optional[bool] = field(default=False)
-    # dtype: Optional[str] = field(default="bfloat16")
-
-@dataclass
-class DataArguments:
-    dataset_name_or_path: str = field(default=None, metadata={"help": "Path to the training data."})
-    num_proc: Optional[int] = field(default=None, metadata={"help": "Number of processes."})
-    label_pad_token_id: Optional[int] = field(default=-100)
-    prefix_prompt: Optional[str] = field(default="")
-    postfix_prompt: Optional[str] = field(default="")
-    max_length: Optional[int] = field(
-        default=512,
-        metadata={"help": "Maximum sequence length."}
-    )
-
-
-# ==================================================
-#                     LOAD MODEL
-# ==================================================
-def load_model(args):
-    model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
-                trust_remote_code=args.trust_remote_code,
-                load_in_8bit=args.load_in_8bit,
-                # torch_dtype=args.dtype,
-                cache_dir=args.cache_dir)
-
-    # if torch.__version__ >= "2" and sys.platform != "win32":
-    #     model = torch.compile(model)
-    
-    return model
 
 # ==================================================
 #              LOAD & PROCESSING DATASET
@@ -88,70 +40,6 @@ def load_data(args):
                                         num_proc=args.num_proc)
     
     return dataset
-
-def preprocess_fn(
-    examples, 
-    args: DataArguments,
-    tokenizer: transformers.PreTrainedTokenizer) -> Dict:
-    prefix_prompt_tokens , postfix_prompt_tokens = [], []
-    if args.prefix_prompt is not None:
-        prefix_prompt_tokens = tokenizer.encode(
-            args.prefix_prompt, 
-            add_special_tokens=False)
-    if args.postfix_prompt is not None:
-        postfix_prompt_tokens = tokenizer.encode(
-            args.postfix_prompt, 
-            add_special_tokens=False)
-    
-    # ============ Customize function ==============
-    bs = len(examples['input'])
-    inputs = [item.strip() for item in examples['input']]
-    outputs = [item.strip() for item in examples['output']]
-    
-    examples = [s + t for s, t in zip(inputs, outputs)]
-    
-    max_length = args.max_length - len(prefix_prompt_tokens) - len(postfix_prompt_tokens)
-    model_inputs, tokenized_source = [tokenizer(strings, 
-                                                truncation=True, 
-                                                max_length=max_length,) 
-                                                # padding=True)
-                                                for strings in (examples, inputs)]
-
-    model_inputs["labels"] = []
-    for i in range(bs):
-        model_inputs["input_ids"][i] = (prefix_prompt_tokens + 
-                                        model_inputs["input_ids"][i] + 
-                                        postfix_prompt_tokens)
-        model_inputs["attention_mask"][i] = [1] * len(model_inputs["input_ids"][i])
-        
-        label = copy.deepcopy(model_inputs["input_ids"][i])
-        label[:len(tokenized_source["input_ids"][i])] = (IGNORE_INDEX,) * len(tokenized_source["input_ids"][i])
-        
-        model_inputs["labels"].append(label)
-    
-        assert len(model_inputs["input_ids"][i]) <= args.max_length
-
-    return model_inputs
-
-@dataclass
-class DataCollatorForSupervisedDataset(object):
-    """Collate examples for supervised fine-tuning."""
-
-    tokenizer: transformers.PreTrainedTokenizer
-
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
-        input_ids = [torch.tensor(x) for x in input_ids]
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
-        )
-        labels = [torch.tensor(x) for x in labels]
-        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
-        return dict(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
-        )
 
 
 def main():
@@ -188,8 +76,41 @@ def main():
     
     # ============ Load model ==============
     set_seed(42)  #  Set seed efore initializing model
-    model = load_model(model_args)
+    model = AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            trust_remote_code=model_args.trust_remote_code,
+            load_in_8bit=model_args.load_in_8bit,
+            # torch_dtype=model_args.dtype,
+            cache_dir=model_args.cache_dir)
     
+    # model = torch.compile(model)  # Pytorch >= 2.0
+    
+    if model_args.lora:
+        from peft import LoraConfig, get_peft_model, \
+            prepare_model_for_kbit_training
+
+        lora_config = LoraConfig( # mixtral config
+            r=8,
+            lora_alpha=16,
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+                "lm_head",
+            ],
+            bias="none",
+            lora_dropout=0.05,  # Conventional
+            task_type="CAUSAL_LM",
+        )
+        model.gradient_checkpointing_enable()
+        model = prepare_model_for_kbit_training(model)
+        model = get_peft_model(model, lora_config)
+        
+        
     if training_args.local_rank > 0: 
         torch.distributed.barrier()
         
@@ -208,26 +129,23 @@ def main():
             "tokenizer": tokenizer, 
         }
     )
-    # train_dataset = tokenized_dataset
     if training_args.local_rank == 0:
         torch.distributed.barrier()
     
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    train_dataset = tokenized_dataset.shuffle(seed=42)
-    # eval_dataset = tokenized_dataset["eval"].shuffle(seed=42)
-    # ds_loader = DataLoader(train_dataset,
-    #                        collate_fn=data_collator,
-    #                        batch_size=training_args.per_device_train_batch_size,
-    #                        pin_memory=True, shuffle=False,
-    #                        sampler=DistributedSampler(train_dataset))
     
-    logger.info(f"Training dataset samples: {len(train_dataset)}")
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    train_dataset, eval_dataset = torch.utils.data.random_split(tokenized_dataset, 
+                                                                [0.9, 0.1])
+    train_dataset = tokenized_dataset.shuffle(seed=42)
+    # eval_dataset = tokenized_dataset.shuffle(seed=42)
+    
+    # Print sample
     if training_args.local_rank == 0:
         logger.info(f"Training dataset samples: {len(train_dataset)}")
+        logger.info(f"Evaluation dataset samples: {len(eval_dataset)}")
         for index in random.sample(range(len(train_dataset)), 3):
             logger.info(f"Sample {index} of the training set: \n{train_dataset[index]['input_ids']}, {train_dataset[index]['labels']}.")
             logger.info(f"Sample {index} of the training set: \n{tokenizer.decode(list(train_dataset[index]['input_ids']))}.")
-
 
     # ============ Training ==============
     logger.info("Start training ...")
@@ -239,7 +157,7 @@ def main():
                       tokenizer=tokenizer,
                       data_collator=data_collator,
                       train_dataset=train_dataset,
-                      eval_dataset=None,
+                      eval_dataset=eval_dataset,
                       compute_metrics=None)
     
     model.config.use_cache = False
