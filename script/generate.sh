@@ -9,14 +9,14 @@ accelerate launch \
     --config_file config/default_config.yaml \
     src/generate.py \
     --model_name_or_path microsoft/phi-2 \
-    --dataset_name_or_path /datadrive05/dungnm31/data/code_alpaca_20k.json \
+    --dataset_name_or_path /datadrive05/dungnm31/llm_template/dummy_code_alpaca.json \
     --batch_size 5 \
     --num_proc 50 \
     --temperature 0.9 \
     --top_p 0.95 \
     --do_sample \
     --num_return_sequences 1 \
-    --max_length 512 \
+    --max_new_tokens 256 \
     --cache_dir /datadrive05/dungnm31/.cache \
     --output_dir ./output \
     # --precision fp16

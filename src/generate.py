@@ -14,11 +14,10 @@ from dataclasses import dataclass, field
 
 import torch
 from datasets import load_dataset
-import datasets
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, \
-    HfArgumentParser, GenerationConfig, DefaultDataCollator
+    HfArgumentParser, GenerationConfig, DataCollatorWithPadding
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -55,13 +54,12 @@ class DataTrainingArguments:
 @dataclass
 class GenerationArguments:
     max_length: Optional[int] = field(default=20)
-    max_new_tokens: Optional[int] = field(default=20)
+    max_new_tokens: Optional[int] = field(default=50)
     do_sample: Optional[bool] = field(default=False)
     num_beams: Optional[int] = field(default=1)
     temperature: Optional[float] = field(default=1.0)
     top_p: Optional[float] = field(default=0.9)
-    diversity_penalty: Optional[float] = field(default=0.0)
-    repetition_penalty: Optional[float] = field(default=1.0)
+    repetition_penalty: Optional[float] = field(default=1.2)
     num_return_sequences: Optional[int] = field(default=1)
 
 
@@ -100,8 +98,7 @@ def preprocess_function(examples, tokenizer, data_args):
     for idx in range(bs):
         new_inputs.append(createPrompt(examples['instruction'][idx]))
     
-    model_inputs = tokenizer(new_inputs, padding=True, return_tensors='pt')
-        
+    model_inputs = tokenizer(new_inputs, padding=True, return_tensors='pt')        
     return model_inputs
 
 # ==================================================
@@ -109,6 +106,7 @@ def preprocess_function(examples, tokenizer, data_args):
 # ==================================================
 
 if __name__ == "__main__":
+    accelerator = Accelerator()
     # Load settings
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, GenerationArguments))
     model_args, data_args, gen_args = parser.parse_args_into_dataclasses()
@@ -136,10 +134,13 @@ if __name__ == "__main__":
                                         "tokenizer": tokenizer, 
                                     })
 
-    ds_loader = DataLoader(tokenized_dataset.with_format("torch"), 
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
+    ds_loader = DataLoader(tokenized_dataset.with_format("torch"),
+                           collate_fn=data_collator,
                            batch_size=data_args.batch_size, 
                            shuffle=False)
     
+    model, ds_loader = accelerator.prepare(model, ds_loader)
     logger.info("Demo input:\n" + tokenizer.decode(tokenized_dataset[0]['input_ids']))
     
     # ===========================================
@@ -150,8 +151,9 @@ if __name__ == "__main__":
     results = []
     for batch_id, batch in tqdm(enumerate(ds_loader), total=len(ds_loader)):
         with torch.no_grad():
-            outputs = model.generate(**batch, generation_config=generation_config,
-                                     pad_token_id=tokenizer.eos_token_id)
+            outputs = accelerator.unwrap_model(model).generate(**batch, 
+                                    generation_config=generation_config,
+                                    pad_token_id=tokenizer.eos_token_id)
         
         batch_results = tokenizer.batch_decode(outputs, 
                                 skip_special_tokens=True,
