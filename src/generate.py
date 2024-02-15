@@ -6,7 +6,6 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-import random
 import pandas as pd
 from tqdm import tqdm
 from typing import Optional
@@ -19,6 +18,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, \
     HfArgumentParser, GenerationConfig, DataCollatorWithPadding
 
+from prompt_utils.prepare_prompt import createBreadthPrompt, createDepthPrompt
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -31,12 +31,9 @@ class ModelArguments:
     model_name_or_path: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
-    cache_dir: Optional[str] = field(
-        default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
-    )
-    trust_remote_code: Optional[bool] = field(
-        default=False, metadata={"help": "Whether to trush remote code"}
-    )
+    cache_dir: Optional[str] = field(default=None)
+    trust_remote_code: Optional[bool] = field(default=False)
+    load_in_8bit: Optional[bool] = field(default=False)
 
 @dataclass
 class DataTrainingArguments:
@@ -78,20 +75,6 @@ def load_data(dataset_name_or_path, cache_dir: str=None):
         
         return dataset["test"]
 
-base_instruction = "<s> [INST] I want you act as a Prompt Creator.\r\n\
-Your goal is to draw inspiration from the #Given Prompt# to create a brand new prompt.\r\n\
-This new prompt should belong to the same domain as the #Given Prompt# but be even more rare.\r\n\
-The LENGTH and complexity of the #Created Prompt# should be similar to that of the #Given Prompt#.\r\n\
-The #Created Prompt# must be reasonable and must be understood and responded by humans.\r\n\
-'#Given Prompt#', '#Created Prompt#', 'given prompt' and 'created prompt' are not allowed to appear in #Created Prompt#\r\n"
-
-# Preprocessing
-def createBreadthPrompt(instruction):
-    prompt = base_instruction
-    prompt += "#Given Prompt#: \r\n {} \r\n".format(instruction)
-    prompt += "#Created Prompt#: \r\n[/INST]"
-    return prompt
-
 def preprocess_function(examples, tokenizer, data_args):
     bs = len(examples['instruction'])
     new_inputs = []
@@ -116,6 +99,7 @@ if __name__ == "__main__":
     logger.info("Loading model ...")
     model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, 
                                                  cache_dir=model_args.cache_dir,
+                                                 load_in_8bit=model_args.load_in_8bit,
                                                  trust_remote_code=model_args.trust_remote_code)
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path,
                                               trust_remote_code=model_args.trust_remote_code)
@@ -161,7 +145,8 @@ if __name__ == "__main__":
         
         results.extend(batch_results)
         if batch_id == 0:
-            logger.info("Demo output:\n" + batch_results[0])
+            logger.info("======== Demo output:\n" + batch_results[0])
+            logger.info("======== ")
     
     os.makedirs(data_args.output_dir, exist_ok=True)
     output_path = os.path.join(data_args.output_dir, f"generated_results.jsonl")

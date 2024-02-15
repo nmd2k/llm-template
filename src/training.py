@@ -137,7 +137,6 @@ def main():
     train_dataset, eval_dataset = torch.utils.data.random_split(tokenized_dataset, 
                                                                 [0.9, 0.1])
     train_dataset = tokenized_dataset.shuffle(seed=42)
-    # eval_dataset = tokenized_dataset.shuffle(seed=42)
     
     # Print sample
     if training_args.local_rank == 0:

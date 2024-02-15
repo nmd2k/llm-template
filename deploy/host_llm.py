@@ -16,11 +16,11 @@ def opt():
     return parser.parse_args()
 
 def inference(text):
-    template = "{instruct}\n"
+    template = "### Instruction:{instruct}\n### Response:"
     
     input_tokens = tokenizer(template.format(instruct=text), return_tensors="pt").to("cuda")
     output_tokens = model.generate(**input_tokens,
-                                   max_length=256, 
+                                   max_length=512, 
                                    do_sample=True, 
                                    temperature=0.95, 
                                    pad_token_id=tokenizer.eos_token_id)
