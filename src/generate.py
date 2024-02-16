@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 import torch
 from datasets import load_dataset
-from accelerate import Accelerator
+from accelerate import Accelerator, PartialState
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, \
     HfArgumentParser, GenerationConfig, DataCollatorWithPadding
@@ -149,7 +149,7 @@ if __name__ == "__main__":
             logger.info("======== ")
     
     os.makedirs(data_args.output_dir, exist_ok=True)
-    output_path = os.path.join(data_args.output_dir, f"generated_results.jsonl")
+    output_path = os.path.join(data_args.output_dir, f"generated_{accelerator.process_index}_results.jsonl")
     df = pd.DataFrame({'generated': results})
     df.to_json(output_path, orient="records", lines=True)
     
