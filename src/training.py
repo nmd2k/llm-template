@@ -62,9 +62,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
                         model_args.model_name_or_path,
                         cache_dir=model_args.cache_dir,
-                        padding_side="right",
+                        padding_side="left",
                         model_max_length=data_args.max_length,
-                        trust_remote_code=model_args.trust_remote_code)
+                        trust_remote_code=model_args.trust_remote_code,
+                        add_eos_token=True,
+                        add_bos_token=True)
     
     logger.info(f"PAD Token: {tokenizer.pad_token}")
     logger.info(f"BOS Token: {tokenizer.bos_token}")
@@ -133,7 +135,7 @@ def main():
         torch.distributed.barrier()
     
     
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     train_dataset, eval_dataset = torch.utils.data.random_split(tokenized_dataset, 
                                                                 [0.9, 0.1])
     train_dataset = tokenized_dataset.shuffle(seed=42)

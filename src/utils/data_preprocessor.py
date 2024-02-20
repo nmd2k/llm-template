@@ -22,6 +22,8 @@ Below is an instruction that describes a task. Write a response that appropriate
 ### Response:
 """
 
+FINE_TUNING_PROMPT = "Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\r\n### Instruction: {}\r\n### Response:"
+
 def preprocess_fn(
     examples, args,
     tokenizer: transformers.PreTrainedTokenizer
@@ -38,25 +40,22 @@ def preprocess_fn(
     
     # ============ Customize function ==============
     bs = len(examples['input'])
+    # insts = [item.strip() for item in examples['instruction']]
     insts = [item.strip() for item in examples['instruction']]
-    inputs = [item.strip() for item in examples['input']]
-    outputs = [item.strip() for item in examples['output']]
+    outputs = [item[0].strip() for item in examples['output']]
     
-    sources = []
-    for i, s in zip(insts, inputs):
-        if s == "":
-            sources.append(NON_INPUT_TEMPLATE.format(instruction=i))
-        else:
-            sources.append(INPUT_TEMPLATE.format(instruction=i, input=s))
+    inputs = []
+    for item in inputs:
+        inputs.append(FINE_TUNING_PROMPT.format(item))
             
-    examples = [s + t for s, t in zip(sources, outputs)]
+    examples = [s + t for s, t in zip(inputs, outputs)]
     
     max_length = args.max_length - len(prefix_prompt_tokens) - len(postfix_prompt_tokens)
     model_inputs, tokenized_source = [tokenizer(strings, 
                                                 truncation=True, 
                                                 max_length=max_length,) 
-                                                # padding=True)
                                                 for strings in (examples, inputs)]
+                                                # padding=True)
 
     model_inputs["labels"] = []
     for i in range(bs):
