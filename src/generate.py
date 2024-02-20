@@ -94,6 +94,7 @@ if __name__ == "__main__":
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, GenerationArguments))
     model_args, data_args, gen_args = parser.parse_args_into_dataclasses()
     generation_config = GenerationConfig(**gen_args.__dict__)
+    os.makedirs(data_args.output_dir, exist_ok=True)
     
     # Load model
     logger.info("Loading model ...")
@@ -132,7 +133,8 @@ if __name__ == "__main__":
     # ===========================================
     start_time = time.time()
     logger.info("Generating ...")
-    results = []
+    save_path = os.path.join(data_args.output_dir, 
+                            f"batch_{accelerator.process_index}.jsonl")
     for batch_id, batch in tqdm(enumerate(ds_loader), total=len(ds_loader)):
         with torch.no_grad():
             outputs = accelerator.unwrap_model(model).generate(**batch, 
@@ -143,15 +145,14 @@ if __name__ == "__main__":
                                 skip_special_tokens=True,
                                 clean_up_tokenization_spaces=True)
         
-        results.extend(batch_results)
         if batch_id == 0:
             logger.info("======== Demo output:\n" + batch_results[0])
             logger.info("======== ")
-    
-    os.makedirs(data_args.output_dir, exist_ok=True)
-    output_path = os.path.join(data_args.output_dir, f"generated_{accelerator.process_index}_results.jsonl")
-    df = pd.DataFrame({'generated': results})
-    df.to_json(output_path, orient="records", lines=True)
+        
+        with open(save_path, "a") as writer:
+            for item in batch_results:
+                json.dump(dict(generation=item), writer)
+                writer.write("\n")
     
     logger.info("Completion time: %d min", (time.time() - start_time) // 60)
     
