@@ -18,7 +18,8 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, \
     HfArgumentParser, GenerationConfig, DataCollatorWithPadding
 
-from prompt_utils.prepare_prompt import createBreadthPrompt, createDepthPrompt
+from prompt_utils.prepare_prompt import createBreadthPrompt, createDepthPrompt, \
+    createMultiAnswerQAPrompt, createTruefalsePrompt
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
