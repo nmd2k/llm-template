@@ -64,9 +64,9 @@ def main():
                         cache_dir=model_args.cache_dir,
                         padding_side="left",
                         model_max_length=data_args.max_length,
-                        trust_remote_code=model_args.trust_remote_code,
-                        add_eos_token=True,
-                        add_bos_token=True)
+                        trust_remote_code=model_args.trust_remote_code,)
+                        # add_eos_token=True,
+                        # add_bos_token=True)
     
     logger.info(f"PAD Token: {tokenizer.pad_token}")
     logger.info(f"BOS Token: {tokenizer.bos_token}")
@@ -124,7 +124,7 @@ def main():
         batched=True,
         num_proc=data_args.num_proc,
         remove_columns=dataset.column_names,
-        load_from_cache_file=True,
+        load_from_cache_file=False,
         desc="Running Encoding",
         fn_kwargs={
             "args": data_args,
@@ -135,7 +135,7 @@ def main():
         torch.distributed.barrier()
     
     
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer,)
     train_dataset, eval_dataset = torch.utils.data.random_split(tokenized_dataset, 
                                                                 [0.9, 0.1])
     train_dataset = tokenized_dataset.shuffle(seed=42)

@@ -22,7 +22,8 @@ Below is an instruction that describes a task. Write a response that appropriate
 ### Response:
 """
 
-FINE_TUNING_PROMPT = "Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\r\n### Instruction: {}\r\n### Response:"
+# FINE_TUNING_PROMPT = "Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\r\n### Instruction: {}\r\n### Response:"
+FINE_TUNING_PROMPT = "Instruct: {}\r\n Output::"
 
 def preprocess_fn(
     examples, args,
@@ -31,31 +32,30 @@ def preprocess_fn(
     prefix_prompt_tokens , postfix_prompt_tokens = [], []
     if args.prefix_prompt is not None:
         prefix_prompt_tokens = tokenizer.encode(
-            args.prefix_prompt, 
+            tokenizer.bos_token + args.prefix_prompt, 
             add_special_tokens=False)
     if args.postfix_prompt is not None:
         postfix_prompt_tokens = tokenizer.encode(
-            args.postfix_prompt, 
+            args.postfix_prompt + tokenizer.eos_token, 
             add_special_tokens=False)
     
     # ============ Customize function ==============
-    bs = len(examples['input'])
+    bs = len(examples['instruction'])
     # insts = [item.strip() for item in examples['instruction']]
     insts = [item.strip() for item in examples['instruction']]
     outputs = [item[0].strip() for item in examples['output']]
     
     inputs = []
-    for item in inputs:
+    for item in insts:
         inputs.append(FINE_TUNING_PROMPT.format(item))
             
     examples = [s + t for s, t in zip(inputs, outputs)]
     
-    max_length = args.max_length - len(prefix_prompt_tokens) - len(postfix_prompt_tokens)
+    max_length = args.max_length - len(prefix_prompt_tokens) - len(postfix_prompt_tokens) # add eos and bos manually
     model_inputs, tokenized_source = [tokenizer(strings, 
                                                 truncation=True, 
-                                                max_length=max_length,) 
+                                                max_length=max_length)
                                                 for strings in (examples, inputs)]
-                                                # padding=True)
 
     model_inputs["labels"] = []
     for i in range(bs):
