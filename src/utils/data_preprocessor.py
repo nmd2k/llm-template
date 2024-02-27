@@ -22,8 +22,8 @@ Below is an instruction that describes a task. Write a response that appropriate
 ### Response:
 """
 
-# FINE_TUNING_PROMPT = "Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\r\n### Instruction: {}\r\n### Response:"
-FINE_TUNING_PROMPT = "Instruct: {}\r\n Output::"
+# FINE_TUNING_PROMPT = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\r\n### Instruction: {}\r\n### Response:"
+FINE_TUNING_PROMPT = "Instruct: {}\r\n Output:"
 
 def preprocess_fn(
     examples, args,
@@ -40,10 +40,10 @@ def preprocess_fn(
             add_special_tokens=False)
     
     # ============ Customize function ==============
-    bs = len(examples['instruction'])
+    bs = len(examples['input'])
     # insts = [item.strip() for item in examples['instruction']]
-    insts = [item.strip() for item in examples['instruction']]
-    outputs = [item[0].strip() for item in examples['output']]
+    insts = [item.strip() for item in examples['input']]
+    outputs = [item.strip() for item in examples['generation']]
     
     inputs = []
     for item in insts:

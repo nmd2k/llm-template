@@ -16,6 +16,8 @@ from transformers import HfArgumentParser, TrainingArguments, \
 from utils.train_args import ModelArguments, DataArguments
 from utils.data_preprocessor import preprocess_fn
 from utils.data_collator import DataCollatorForSupervisedDataset
+from utils.callbacks import WandbPredictionProgressCallback
+from utils.utils import print_trainable_parameters
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")  # Ignore Transformers' caching warning
@@ -111,6 +113,7 @@ def main():
         model.gradient_checkpointing_enable()
         model = prepare_model_for_kbit_training(model)
         model = get_peft_model(model, lora_config)
+        print_trainable_parameters(model)
         
         
     if training_args.local_rank > 0: 
@@ -136,11 +139,9 @@ def main():
     
     
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer,)
-    train_dataset, eval_dataset = torch.utils.data.random_split(tokenized_dataset, 
-                                                                [0.9, 0.1])
-    train_dataset = tokenized_dataset.shuffle(seed=42)
+    train_dataset, eval_dataset = tokenized_dataset.train_test_split(test_size=0.2).values()
+    train_dataset = train_dataset.shuffle(seed=42)
     
-    # Print sample
     if training_args.local_rank == 0:
         logger.info(f"Training dataset samples: {len(train_dataset)}")
         logger.info(f"Evaluation dataset samples: {len(eval_dataset)}")
@@ -162,6 +163,19 @@ def main():
                       compute_metrics=None)
     
     model.config.use_cache = False
+    
+    # Instantiate the WandbPredictionProgressCallback
+    if training_args.report_to:
+        progress_callback = WandbPredictionProgressCallback(
+            trainer=trainer,
+            tokenizer=tokenizer,
+            val_dataset=eval_dataset,
+            num_samples=5,
+            freq=1,
+        )
+
+    # Add the callback to the trainer
+    trainer.add_callback(progress_callback)
 
     trainer.train()
     trainer.save_state()
