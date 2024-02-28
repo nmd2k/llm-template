@@ -4,17 +4,11 @@ import pandas as pd
 
 from transformers.integrations import WandbCallback
 
-def decode_predictions(tokenizer, predictions):
-    label_ids = [
-        [l for l in label if l != -100]
-        for label in predictions.label_ids
-    ]
-    # BUG HERE!
-    # prediction_ids = [[l for l in label if l != -100] for label in predictions.predictions]
-    logits = predictions.predictions.argmax(axis=-1)
-    labels = tokenizer.batch_decode(label_ids,
+def decode_predictions(tokenizer, predictions, samples):
+    labels = tokenizer.batch_decode(samples['input_ids'],
                                 skip_special_tokens=True,
                                 clean_up_tokenization_spaces=True)
+    logits = predictions.predictions.argmax(axis=-1)
     prediction_text = tokenizer.batch_decode(logits, 
                                 skip_special_tokens=True,
                                 clean_up_tokenization_spaces=True)
@@ -63,11 +57,9 @@ class WandbPredictionProgressCallback(WandbCallback):
         # every `freq` epochs
         if state.epoch % self.freq == 0:
             # generate predictions
-            # from IPython import embed
-            # embed()
             predictions = self.trainer.predict(self.sample_dataset)
             # decode predictions and labels
-            predictions = decode_predictions(self.tokenizer, predictions)
+            predictions = decode_predictions(self.tokenizer, predictions, self.sample_dataset)
             # add predictions to a wandb.Table
             predictions_df = pd.DataFrame(predictions)
             predictions_df["epoch"] = state.epoch

@@ -35,6 +35,7 @@ class ModelArguments:
     cache_dir: Optional[str] = field(default=None)
     trust_remote_code: Optional[bool] = field(default=False)
     load_in_8bit: Optional[bool] = field(default=False)
+    peft_model: Optional[str] = field(default=None)
 
 @dataclass
 class DataTrainingArguments:
@@ -76,11 +77,16 @@ def load_data(dataset_name_or_path, cache_dir: str=None):
         
         return dataset["test"]
 
+PROMPT_TEMPLATE = "Below is an instruction that describes a task. \
+Write a response that appropriately completes the request.\r\n\
+### Question: {}\r\n\
+### Answer:"
+
 def preprocess_function(examples, tokenizer, data_args):
-    bs = len(examples['instruction'])
+    bs = len(examples['question'])
     new_inputs = []
     for idx in range(bs):
-        new_inputs.append(createBreadthPrompt(examples['instruction'][idx]))
+        new_inputs.append(PROMPT_TEMPLATE.format(examples['question'][idx]))
     
     model_inputs = tokenizer(new_inputs, padding=True, return_tensors='pt')        
     return model_inputs
@@ -103,6 +109,11 @@ if __name__ == "__main__":
                                                  cache_dir=model_args.cache_dir,
                                                  load_in_8bit=model_args.load_in_8bit,
                                                  trust_remote_code=model_args.trust_remote_code)
+    
+    if model_args.peft_model:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, model_args.peft_model)
+    
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path,
                                               trust_remote_code=model_args.trust_remote_code)
     tokenizer.pad_token = tokenizer.eos_token
