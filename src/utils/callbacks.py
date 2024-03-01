@@ -5,14 +5,18 @@ import pandas as pd
 from transformers.integrations import WandbCallback
 
 def decode_predictions(tokenizer, predictions, samples):
-    labels = tokenizer.batch_decode(samples['input_ids'],
+    labels = [[l for l in label if l != -100] for label in predictions.label_ids]
+    labels = tokenizer.batch_decode(labels,
+                                skip_special_tokens=True,
+                                clean_up_tokenization_spaces=True)
+    inputs = tokenizer.batch_decode(samples['input_ids'],
                                 skip_special_tokens=True,
                                 clean_up_tokenization_spaces=True)
     logits = predictions.predictions.argmax(axis=-1)
     prediction_text = tokenizer.batch_decode(logits, 
                                 skip_special_tokens=True,
                                 clean_up_tokenization_spaces=True)
-    return {"labels": labels, "predictions": prediction_text}
+    return {"inputs": inputs, "labels": labels, "predictions": prediction_text}
 
 class WandbPredictionProgressCallback(WandbCallback):
     """Custom WandbCallback to log model predictions during training.
@@ -55,7 +59,7 @@ class WandbPredictionProgressCallback(WandbCallback):
         super().on_evaluate(args, state, control, **kwargs)
         # control the frequency of logging by logging the predictions
         # every `freq` epochs
-        if state.epoch % self.freq == 0:
+        if int(state.epoch) % self.freq == 0:
             # generate predictions
             predictions = self.trainer.predict(self.sample_dataset)
             # decode predictions and labels
@@ -69,11 +73,11 @@ class WandbPredictionProgressCallback(WandbCallback):
                 # log the table to wandb
                 self._wandb.log({"sample_predictions": records_table})
 
-    def on_train_end(self, args, state, control, **kwargs):
-      super().on_train_end(args, state, control, **kwargs)
-      if args.local_rank == 0:
-        log_path = os.path.join(args.output_dir, 'exp.log')
+    # def on_train_end(self, args, state, control, **kwargs):
+    #   super().on_train_end(args, state, control, **kwargs)
+    #   if args.local_rank == 0:
+    #     log_path = os.path.join(args.output_dir, 'exp.log')
         
-        log_reader = self._wandb.Artifact("log", type="log")
-        log_reader.add_file(log_path)
-        self._wandb.run.log_artifact(log_reader)
+    #     log_reader = self._wandb.Artifact("log", type="log")
+    #     log_reader.add_file(log_path)
+    #     self._wandb.run.log_artifact(log_reader)

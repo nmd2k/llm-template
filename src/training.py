@@ -170,7 +170,7 @@ def main():
             trainer=trainer,
             tokenizer=tokenizer,
             val_dataset=eval_dataset,
-            num_samples=5,
+            num_samples=100,
             freq=1,
         )
 
